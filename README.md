@@ -3,7 +3,7 @@ python-remotestorage
 
 An implementation of remotestorage for Python, using a git backend.
 
-Use at your own risk. This is 
+Use at your own risk. This is currently a one day hack and has yet to be tested against even benevolent clients.
 
 The remotestorage implementation takes the form of two WSGI daemons, one for storage and one for authentication. The most convenient way (IMHO) to run these, is to have them supervised by daemontools, runit or supervisord. An http server such as nginx should forward the HTTP requests to the two daemons. 
 
