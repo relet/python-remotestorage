@@ -43,9 +43,14 @@ If you wish to grant access, please register the following code: "%s". <br />
 </html>
 """
 
-tokens = {} # FIXME: this is not multi process safe
-accessTokens = {}
+codeTokens    = {} # FIXME: this is not multi process safe
+accessTokens  = {}
 refreshTokens = {}
+
+def log (msg):
+    fd = open("auth.log", "a")
+    fd.write(msg+"\n")
+    fd.close()
 
 def fail(start_response, responseCode, msg):
    start_response(responseCode, [('Content-Type', 'text/plain')])
@@ -69,9 +74,7 @@ def auth(environ, start_response):
     request = environ['REQUEST_URI'] 
     method  = environ['REQUEST_METHOD'] 
 
-    fd = open("auth.log", "a")
-    fd.write("%s %s\n" % (method, request))
-    fd.close()
+    log ("%s %s" % (method, request))
 
     if method == "POST":
       options = environ['wsgi.nput'].read()
@@ -101,12 +104,16 @@ def auth(environ, start_response):
     keys = dict([(access[0], access[1:]) for access in [line.strip().split(" ") for line in open(".auth", "r")]])
 
     if application == "auth":
+      #TODO: handle refresh tokens
       if code in keys:
+        #TODO: at this point, we need a mechanism for the user to give permission to proceed. Not implemented yet.
+        expiry, scope = keys[code]
         if p['response_type'] == "code":
-          tokens[token] = (now, code)
+          codeTokens[token] = (now, code)
           uri = decodedURI+"?code=%s&state=%s" % (token, p['state'])
         elif p['response_type'] == "token":
-          accessTokens[token] = (now, code)
+          accessTokens[token] = (now, code, scope)
+          log ("new token %s" % token)
           uri = "#access_token=%s&token_type=bearer&expires_in=%d&scope=%s&state=%s"
           uri = decodedURI + uri % (token, ACCESS_TOKEN_EXPIRY, "+".join(keys[code]), p.get('state',''))
 
@@ -116,35 +123,37 @@ def auth(environ, start_response):
         result = MSG_AUTH_REQUEST
         result = result % (p['client_id'], decodedURI, p.get('scope','Not specified'), 'state' in p, code, p['client_id'], p['redirect_uri'], p.get('state',''), p['response_type'])
 
-    elif application == "token":
-      if not p['grant_type'] == "authorization_code":
-        return "parameter grant_type missing" #fail 
-
-      token  = p['code']
-      if token in tokens:
-        timestamp, client = tokens[token]
-        if time.time()-timestamp > TOKEN_EXPIRY: 
-          return "timeout" #fail 
-        if code != client:
-          return "token does not match client" #fail 
-
-        accessTokens[token] = (now, code)
-        refreshToken = buildToken(time.time(), SALT + code) #FIXME: use more variance? 
-        accessTokens[refreshToken] = (now, code)
-
-        returnContentType = "application/json;charset=UTF-8"
-        jsondata = {
-          "access_token": token,
-          "token_type": "bearer",
-          "expires_in": ACCESSTOKEN_EXPIRY,
-          "refresh_token": refreshToken,
-        }
-        result = json.dumps(jsondata)
+#    elif application == "token": # IS THIS EVEN USED?
+#      if not "grant_type" in p:
+#        return "parameter grant_type missing" #fail 
+#
+#      if p['grant_type'] == "authorization_code" :
+#        codeToken  = p['code']
+#        if codeToken in codeTokens:
+#          timestamp, client = codeTokens[codeToken]
+#          if time.time()-timestamp > TOKEN_EXPIRY: 
+#            return "timeout" #fail 
+#          if code != client:
+#            return "token does not match client" #fail 
+#  
+#          accessTokens[token] = (now, code)
+#          refreshToken = buildToken(time.time(), SALT + code) #FIXME: use more variance? 
+#          refreshTokens[refreshToken] = (now, code)
+#
+#          returnContentType = "application/json;charset=UTF-8"
+#          jsondata = {
+#            "access_token": token,
+#            "token_type": "bearer",
+#            "expires_in": ACCESSTOKEN_EXPIRY,
+#            "refresh_token": refreshToken,
+#          }
+#          result = json.dumps(jsondata)
 
     elif application == "vrfy":
       returnContentType = "application/json;charset=UTF-8"
       if p['access_type'] == "token":
         token = p['token']
+        log ("vrfy token %s is valid: %s" % (token, str(token in accessTokens)))
         if token in accessTokens:
           timestamp, code, scope = accessTokens[token]
           if time.time() > timestamp + ACCESS_TOKEN_EXPIRY:

@@ -2,11 +2,7 @@
 """
 remote storage web service.
 should implement https://tools.ietf.org/id/draft-dejong-remotestorage-00.txt
-
-current status:
-
-
-To be run behind an nginx server, and supervised by daemontools."""
+"""
 
 from flup.server.fcgi import WSGIServer
 import datetime, time, os, sys, re
@@ -36,8 +32,15 @@ HTTP_409_PUTFAILED      = '409 Contitional PUT request failed' #TODO
 HTTP_420_OVERLOAD       = '420 Too Many Requests' #TODO
 HTTP_500_INTERNAL_ERROR = '500 Internal Server Error'
 
-RE_FILENAME = '([a-ZA-Z0-9%_-]+)'
-RE_PATH     = '([a-zA-Z0-9%_-]+(/[a-zA-Z0-9%_-]*/?)*)'
+RE_FILENAME = '([a-ZA-Z0-9%\._-]+)'
+RE_PATH     = '([a-zA-Z0-9%\._-]+[a-zA-Z0-9%/\._-]*)' # NOTE: allowing dots in filenames is not allowed in [UNHOSTED] RFC!
+
+TOKEN_VERIFY_URI  = 'http://relet.net/auth/vrfy'
+
+def log(msg):
+   fd = open("rs.log","a")
+   fd.write(msg+"\n")
+   fd.close()
 
 def verify_path(path):
   try:
@@ -52,18 +55,24 @@ def verify_repository(name, create):
   except NotGitRepository,ex:
     if create:
       os.mkdir(name)
+
       repo = Repo.init(name)
       return repo
 
 def fail(start_response, responseCode, msg):
+   log ("%s %s" % (responseCode, msg))
    start_response(responseCode, [('Content-Type', 'text/plain')])
    return msg
 
 def verify(authorization):
-   blob = urllib.open("/auth/vrfy?access_type=token&token=%s" % authorization).read()
-   vrfy = json.loads(blob)
-   if 'verified-for' in vrfy:
-     return vrfy['scope'] 
+   request  = TOKEN_VERIFY_URI+"?access_type=token&token=%s" % authorization
+   try:
+     response = urllib.urlopen(request).read()
+     vrfy = json.loads(response)
+     if 'verified-for' in vrfy:
+       return vrfy['scope'] 
+   except IOError,ex: # unauthorized, probably
+     pass
    return False
 
 def rs(environ, start_response):
@@ -72,23 +81,39 @@ def rs(environ, start_response):
     returnContentType  = 'text/json'
     customHeaders = None
 
-    fd = open("rs.log","a")
-    fd.write("%s %s\n" % (environ['REQUEST_METHOD'], environ['REQUEST_URI']))
-    fd.close()
+    log("%s %s" % (environ['REQUEST_METHOD'], environ['REQUEST_URI']))
  
     cursor=None
     try:
       method = environ['REQUEST_METHOD']
 
-      if method == "OPTIONS":
-        customHeaders = [('Access-Control-Allow-Methods', 'GET, PUT, DELETE')]
-        return "Welcome."
+      if not 'HTTP_ORIGIN' in environ:
+        return fail(start_response, HTTP_400_MALFORMED, "ORIGIN header field is mandatory") # FIXME for all requests?!
+      origin = environ['HTTP_ORIGIN'] 
 
-      authorization     = environ.get('HTTP_Authorization',None) 
+      if method == "OPTIONS":
+
+        headers =  [
+                    ('Content-Type', returnContentType),
+                    ('Access-Control-Allow-ORIGIN', origin),
+                    ('Access-Control-Allow-Methods', 'GET, PUT, DELETE'),
+                    ('Access-Control-Allow-Headers', 'origin, authorization'),
+                   ]
+        start_response(responseCode, headers)
+        return str(headers)
+
+      #if not 'HTTP_ETAG' in environ:
+      #  return fail(start_response, HTTP_400_MALFORMED, "ETag header field is mandatory") # FIXME for all requests?!
+      version = environ.get('HTTP_ETAG',0)
+
+      authorization     = environ.get('HTTP_AUTHORIZATION',None) 
       if not authorization:
         return fail(start_response, HTTP_401_UNAUTHORIZED, "Not a public storage")
    
-      scope = verify(authorization)
+      authtype, authtoken = authorization.split(" ")
+      if not authtype == "Bearer":
+        return fail(start_response, HTTP_401_UNAUTHORIZED, "Only Bearer tokens supported")
+      scope = verify(authtoken)
       if not scope:
         return fail(start_response, HTTP_401_UNAUTHORIZED, "Invalid access token")
 
@@ -98,20 +123,15 @@ def rs(environ, start_response):
       filepath = "/".join(parms[3:])
       repository = parms[2]
 
-      if not 'HTTP_ETag' in environ:
-        return fail(start_response, HTTP_400_MALFORMED, "ETag header field is mandatory") # FIXME for all requests?!
-      if not 'HTTP_Origin' in environ:
-        return fail(start_response, HTTP_400_MALFORMED, "Origin header field is mandatory") # FIXME for all requests?!
+      ifUnmodifiedSince = long(environ.get('HTTP_IF-UNMODIFIED-SINCE','0'))
+      ifModifiedSince   = long(environ.get('HTTP_IF-MODIFIED-SINCE','0'))
 
-      version = environ['HTTP_ETag']  
-      origin  = environ['HTTP_Origin'] 
-      ifUnmodifiedSince = long(environ.get('HTTP_If-Unmodified-Since','0'))
-      ifModifiedSince   = long(environ.get('HTTP_If-Modified-Since','0'))
-
-      if not verify_path(repository) or not verify_path(filepath):
+      if (not verify_path(repository)) or (not verify_path("repo/"+filepath)):
+        log("repository = %s -> %s" % (repository, verify_path(repository)))
+        log("filepath   = %s -> %s" % (filepath, verify_path("repo/"+filepath)))
         return fail(start_response, HTTP_400_MALFORMED, "URI contains illegal characters")
 
-      repo = verify_repository(repository, create=(method is "PUT")) 
+      repo = verify_repository(repository, create=(method == "PUT")) 
       index = repo.open_index()
 
       if method == "GET": #=====================================================================
@@ -178,9 +198,12 @@ def rs(environ, start_response):
         contentType = environ['CONTENT_TYPE'] 
 
         try:
-          os.makedirs("/".join(parms[2:-1]))
+          nudir = "/".join(parms[2:-1])
+          os.makedirs(nudir)
+          log("made directory %s" % nudir)
         except:
           pass
+        log("writing %s" % (repository + "/" + filepath))
         f = open(repository + "/" + filepath, "w")
         f.write(content)
         f.close()
@@ -219,10 +242,9 @@ def rs(environ, start_response):
       traceback.print_tb(exc_traceback, limit=1, file=sys.stdout)
       result['exception']=str(ex)
        
-    # TODO: Add headers if required
     headers =  [('ETag', version), 
                 ('Content-Type', returnContentType),
-                ('Access-Control-Allow-Origin', origin),
+                ('Access-Control-Allow-ORIGIN', origin),
                ]
     if customHeaders: 
       headers.append(customHeaders)
@@ -246,21 +268,10 @@ def main(args_in, app_name="rs"):
         print "ERROR: server number not specified"
         p.print_help()
 
-        print "Running test cases."
-        def fd(): return open("content", "r")
-        #print rs({'HTTP_ETag':'0','HTTP_Origin':'http://localhost','REQUEST_URI':'//tr$&&','REQUEST_METHOD':'PUT','wsgi.input':fd()}, lambda x,y:None)
-        #print rs({'HTTP_ETag':'0','HTTP_Origin':'http://localhost','REQUEST_URI':'//test/test2','REQUEST_METHOD':'PUT','wsgi.input':fd(),'CONTENT_TYPE':'text/plain'}, lambda x,y:None)
-        #print rs({'HTTP_ETag':'0','HTTP_Origin':'http://localhost','REQUEST_URI':'//test/test2','REQUEST_METHOD':'PUT','HTTP_If-Unmodified-Since':'1'}, lambda x,y:None)
-        #print rs({'HTTP_ETag':'0','HTTP_Origin':'http://localhost','REQUEST_URI':'//test/test3/test4','REQUEST_METHOD':'PUT','wsgi.input':fd(),'CONTENT_TYPE':'text/plain'}, lambda x,y:None)
-        #print rs({'HTTP_ETag':'0','HTTP_Origin':'http://localhost','REQUEST_URI':'//test/test2','REQUEST_METHOD':'GET'}, lambda x,y:None)
-        #print rs({'HTTP_ETag':'0','HTTP_Origin':'http://localhost','REQUEST_URI':'//test/test2','REQUEST_METHOD':'GET','HTTP_If-Modified-Since':'10000000000000'}, lambda x,y:None)
-        #print rs({'HTTP_ETag':'0','HTTP_Origin':'http://localhost','REQUEST_URI':'//test/test3/','REQUEST_METHOD':'GET','HTTP_If-Modified-Since':'10000000000000'}, lambda x,y:None)
-        #print rs({'HTTP_ETag':'0','HTTP_Origin':'http://localhost','REQUEST_URI':'//test/test3/','REQUEST_METHOD':'GET'}, lambda x,y:None)
-        #print rs({'HTTP_ETag':'0','HTTP_Origin':'http://localhost','REQUEST_URI':'//test/test2/','REQUEST_METHOD':'GET'}, lambda x,y:None)
-        #print rs({'HTTP_ETag':'0','HTTP_Origin':'http://localhost','REQUEST_URI':'//test/test3/test4','REQUEST_METHOD':'GET'}, lambda x,y:None)
-        #print rs({'HTTP_ETag':'0','HTTP_Origin':'http://localhost','REQUEST_URI':'//test/test2','REQUEST_METHOD':'DELETE'}, lambda x,y:None)
-        #print rs({'HTTP_ETag':'0','HTTP_Origin':'http://localhost','REQUEST_URI':'//test/test3/test4','REQUEST_METHOD':'DELETE'}, lambda x,y:None)
-        print rs({'HTTP_ETag':'0','HTTP_Origin':'http://localhost','REQUEST_URI':'//test/test3/test4','REQUEST_METHOD':'OPTIONS'}, lambda x,y:None)
+        print rs({'REQUEST_URI':'//public/documents','REQUEST_METHOD':'GET','HTTP_ORIGIN':'http://litewrite.net', 'HTTP_AUTHORIZATION':'Bearer 6c517dbce2ae68497bd3fe4ce1cc65eb'}, lambda x,y:None)
+
+        print verify_path("repo/locations/collections/")
+        print verify_path("repo/pictures/Camera/D7C5FF07-5711-46BF-AD83-9EF05C6D6780.jpg")
         return
 
     socketfile = get_socketpath(app_name, opt.server_num)
