@@ -30,5 +30,5 @@ rs.py
 
 This is the git remote storage daemon. It replies to any GET, PUT, DELETE and OPTION request according to the standard.
 
-Storage is currently implemented by creating a git repository per module in the current directory. External git repositories are on the todo list. Any GET, PUT or DELETE operation results in a commit by the daemon.
+Storage is currently implemented by creating a git repository per module in the current directory. External git repositories are on the todo list. Any PUT or DELETE operation results in a commit by the daemon.
 
